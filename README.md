@@ -144,6 +144,7 @@ Every failure toast in Claude includes an `ofid_…` reference; if you file an i
 - Everything Claude can do, it does **as the Mealie user who owns the API token**. Create a dedicated Mealie user if you want to limit blast radius.
 - The MCP endpoint is only reachable with a valid bearer token; the login page is the only unauthenticated surface (plus OAuth metadata/registration, which are public by design).
 - For belt-and-braces you can restrict the hostname at your proxy/tunnel to Anthropic's egress range `160.79.104.0/21` — but note *you* also need to reach `/login` from your phone/browser during connect, so allow that too (or only enforce the IP rule on `/mcp`, `/token`, `/register`).
+- Failed logins lock out the client IP after 5 attempts. The IP is the last `X-Forwarded-For` hop, which your reverse proxy appends; the first entry is client-controlled and is not trusted.
 - Revoke access at any time: delete `data/auth_state.json` and restart (or just rotate `MCP_LOGIN_PASSWORD` — existing tokens keep working until they expire, so delete the file too).
 
 ## Local development

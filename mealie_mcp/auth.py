@@ -149,9 +149,13 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         return f"{self.settings.public_base}/login?state={login_state}"
 
     def _client_ip(self, request: Request) -> str:
-        fwd = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for")
+        # Only the last X-Forwarded-For hop is written by the proxy in front of us
+        # (nginx/NPM append $remote_addr; Cloudflare appends the client address). The
+        # first entry and CF-Connecting-IP behind nginx are client-supplied, so trusting
+        # them let a rotating value bypass the login lockout.
+        fwd = request.headers.get("x-forwarded-for")
         if fwd:
-            return fwd.split(",")[0].strip()
+            return fwd.split(",")[-1].strip()
         return request.client.host if request.client else "unknown"
 
     def _locked_out(self, ip: str) -> bool:
