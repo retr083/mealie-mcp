@@ -100,7 +100,7 @@ async def healthz(_: Request) -> Response:
 
 @mcp.custom_route("/", methods=["GET"])
 async def index(_: Request) -> Response:
-    return PlainTextResponse(f"Mealie MCP server. Add {settings.mcp_endpoint} as a custom connector in Claude.\n")
+    return PlainTextResponse(f"Mealie MCP server. Add {settings.mcp_endpoint} as a custom connector in your MCP client (for example Claude or Grok).\n")
 
 
 # ---------------------------------------------------------------- recipes

@@ -1,5 +1,8 @@
+import json
+from typing import Annotated
+
 from pydantic import AnyHttpUrl, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -20,8 +23,10 @@ class Settings(BaseSettings):
     mcp_scope: str = "mealie"
     # Redirect URIs a dynamically-registered client may use. Claude's hosted surfaces
     # (web/desktop/mobile) use the claude.ai callback; Claude Code uses a loopback
-    # redirect on a random port (port is ignored when matching).
-    mcp_allowed_redirect_uris: list[str] = [
+    # redirect on a random port (port is ignored when matching). Grok (web, mobile and
+    # Tesla) uses https://grok.com/connectors-oauth-exchange-code/.
+    # NoDecode: read the env var as text (comma-separated, as documented) instead of JSON.
+    mcp_allowed_redirect_uris: Annotated[list[str], NoDecode] = [
         "https://claude.ai/api/mcp/auth_callback",
         "http://localhost/callback",
         "http://127.0.0.1/callback",
@@ -31,6 +36,8 @@ class Settings(BaseSettings):
     @classmethod
     def _split_csv(cls, v):
         if isinstance(v, str):
+            if v.strip().startswith("["):  # JSON list, still accepted
+                return json.loads(v)
             return [s.strip() for s in v.split(",") if s.strip()]
         return v
 

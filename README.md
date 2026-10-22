@@ -5,7 +5,7 @@ A remote MCP server for [Mealie](https://mealie.io) that you can add to Claude a
 - **Streamable HTTP** transport at `/mcp` (what Claude's connectors require)
 - **Built-in OAuth 2.1 authorization server** (dynamic client registration, PKCE, refresh-token rotation) with a single-password login page — nothing else to run
 - Tokens/clients persist to a JSON file, so restarts don't force re-authorisation
-- Only allows the Claude callback URLs as OAuth redirects, so nobody can register a phishing client against your login page
+- Only allows the configured callback URLs as OAuth redirects (Claude's by default, Grok's on request), so nobody can register a phishing client against your login page
 - Failed-login lockout (5 attempts → 5 minute cool-off per IP)
 
 ## Tools
@@ -105,6 +105,16 @@ claude mcp add --transport http mealie https://mealie-mcp.yourdomain.com/mcp
 
 then `/mcp` inside Claude Code to trigger the login.
 
+## Connect Grok
+
+Grok (web, mobile and the in-car Tesla assistant) supports custom MCP connectors with this server. Add Grok's callback to the allowlist in `.env` and restart:
+
+```bash
+MCP_ALLOWED_REDIRECT_URIS=https://grok.com/connectors-oauth-exchange-code/
+```
+
+(Keep the Claude callbacks in the list too if you use both.) Then in Grok: *Connectors* → *New connector* → *Custom* → name `Mealie`, URL `https://mealie-mcp.yourdomain.com/mcp`. Grok opens your login page; enter `MCP_LOGIN_PASSWORD`. Connectors belong to the Grok account, so a Tesla signed in to the same account uses it too.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -137,7 +147,7 @@ Every failure toast in Claude includes an `ofid_…` reference; if you file an i
 | `MCP_DATA_DIR` | `/data` | Where `auth_state.json` lives |
 | `MCP_ACCESS_TOKEN_TTL` | `3600` | Access token lifetime (s). Claude refreshes automatically. |
 | `MCP_REFRESH_TOKEN_TTL` | `2592000` | Refresh token lifetime (s) — how long before you must log in again |
-| `MCP_ALLOWED_REDIRECT_URIS` | claude.ai callback + loopback | Comma-separated allowlist for OAuth clients |
+| `MCP_ALLOWED_REDIRECT_URIS` | claude.ai callback + loopback | Comma-separated (or JSON list) allowlist for OAuth clients; add `https://grok.com/connectors-oauth-exchange-code/` for Grok |
 
 ## Security notes
 

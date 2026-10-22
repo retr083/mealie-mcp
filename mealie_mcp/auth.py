@@ -170,10 +170,11 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         pending = self.pending.get(state)
         if not pending:
             return HTMLResponse(
-                _page("Sign-in link expired", "<p>Start the connection again from Claude.</p>"), status_code=400
+                _page("Sign-in link expired", "<p>Start the connection again from your AI assistant.</p>"), status_code=400
             )
         client = self.clients.get(pending["client_id"])
-        client_name = html.escape((client.client_name if client else None) or pending["client_id"])
+        raw_name = (client.client_name if client else None) or pending["client_id"]
+        client_name = html.escape(raw_name)
         redirect_host = html.escape(urlsplit(pending["redirect_uri"]).netloc)
         err_html = f'<p class="err">{html.escape(error)}</p>' if error else ""
         body = f"""
@@ -187,7 +188,7 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             <input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
             <button type="submit">Allow access</button>
           </form>"""
-        return HTMLResponse(_page("Connect Claude to Mealie", body))
+        return HTMLResponse(_page(f"Connect {raw_name} to Mealie", body))
 
     async def handle_login(self, request: Request) -> Response:
         self._prune()
@@ -197,7 +198,7 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         pending = self.pending.get(state)
         if not pending:
             return HTMLResponse(
-                _page("Sign-in link expired", "<p>Start the connection again from Claude.</p>"), status_code=400
+                _page("Sign-in link expired", "<p>Start the connection again from your AI assistant.</p>"), status_code=400
             )
 
         ip = self._client_ip(request)
