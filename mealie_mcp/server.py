@@ -14,36 +14,56 @@ import uvicorn
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp_types import ToolAnnotations
 
 from .auth import MealieOAuthProvider
 from .config import Settings
-from .mealie import MealieClient, plan_entry, recipe_full, recipe_summary, shopping_item
+from .mealie import MealieClient, MealieError, plan_entry, recipe_full, recipe_summary, shopping_item
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("mealie_mcp")
 
 settings = Settings()
 oauth = MealieOAuthProvider(settings)
-_mealie: MealieClient | None = None
+_clients: dict[str, MealieClient] = {}
+_probe: MealieClient | None = None
 
 
 def mealie() -> MealieClient:
-    assert _mealie is not None, "Mealie client not initialised"
-    return _mealie
+    """Client authenticated as the Pocket ID user on this MCP request."""
+    access = get_access_token()
+    subject = access.subject if access else None
+    token = oauth.mealie_token_for(subject)
+    if not token:
+        raise MealieError("This connection has no linked Mealie user. Connect the connector again and link an API token.")
+    client = _clients.get(token)
+    if client is None:
+        client = MealieClient(str(settings.mealie_url), token)
+        _clients[token] = client
+    return client
+
+
+def probe() -> MealieClient:
+    global _probe
+    if _probe is None:
+        _probe = MealieClient(str(settings.mealie_url))
+    return _probe
 
 
 @asynccontextmanager
 async def lifespan(_: MCPServer) -> AsyncIterator[None]:
-    global _mealie
-    _mealie = MealieClient(str(settings.mealie_url), settings.mealie_api_token)
     try:
         yield
     finally:
-        await _mealie.aclose()
-        _mealie = None
+        for client in _clients.values():
+            await client.aclose()
+        _clients.clear()
+        if _probe is not None:
+            await _probe.aclose()
+        await oauth.pocket_id.aclose()
 
 
 mcp = MCPServer(
@@ -81,18 +101,23 @@ DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorl
 
 @mcp.custom_route("/login", methods=["GET"])
 async def login_get(request: Request) -> Response:
-    return oauth.login_page(request)
+    return await oauth.start_login(request)
 
 
-@mcp.custom_route("/login", methods=["POST"])
-async def login_post(request: Request) -> Response:
-    return await oauth.handle_login(request)
+@mcp.custom_route("/oidc/callback", methods=["GET"])
+async def oidc_callback(request: Request) -> Response:
+    return await oauth.handle_oidc_callback(request)
+
+
+@mcp.custom_route("/link", methods=["POST"])
+async def link_post(request: Request) -> Response:
+    return await oauth.handle_link(request)
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(_: Request) -> Response:
     try:
-        await mealie().get("/api/app/about")
+        await probe().get("/api/app/about")
         return JSONResponse({"ok": True, "mealie": "reachable"})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "mealie": str(e)}, status_code=503)

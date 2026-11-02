@@ -7,11 +7,15 @@ class Settings(BaseSettings):
 
     # Mealie
     mealie_url: AnyHttpUrl
-    mealie_api_token: str
+
+    # Pocket ID. The MCP server stays the OAuth server Claude talks to, and
+    # redirects the person here so each connector session is their own login.
+    pocket_id_issuer: AnyHttpUrl
+    pocket_id_client_id: str
+    pocket_id_client_secret: str
 
     # This server
     public_url: AnyHttpUrl
-    mcp_login_password: str
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8000
     mcp_data_dir: str = "/data"
@@ -32,13 +36,6 @@ class Settings(BaseSettings):
     def _split_csv(cls, v):
         if isinstance(v, str):
             return [s.strip() for s in v.split(",") if s.strip()]
-        return v
-
-    @field_validator("mcp_login_password")
-    @classmethod
-    def _password_len(cls, v: str) -> str:
-        if len(v) < 12:
-            raise ValueError("MCP_LOGIN_PASSWORD must be at least 12 characters")
         return v
 
     @property

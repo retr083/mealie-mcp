@@ -1,9 +1,9 @@
 # mealie-mcp
 
-A remote MCP server for [Mealie](https://mealie.io) that you can add to Claude as a **custom connector** — including the Claude mobile app — without any third-party auth service.
+A remote MCP server for [Mealie](https://mealie.io) that you can add to Claude as a **custom connector** — including the Claude mobile app. This fork signs the person in with [Pocket ID](https://pocket-id.org) and calls Mealie with that person's own API token.
 
 - **Streamable HTTP** transport at `/mcp` (what Claude's connectors require)
-- **Built-in OAuth 2.1 authorization server** (dynamic client registration, PKCE, refresh-token rotation) with a single-password login page — nothing else to run
+- **Built-in OAuth 2.1 authorization server** (dynamic client registration, PKCE, refresh-token rotation) whose login redirects to Pocket ID
 - Tokens/clients persist to a JSON file, so restarts don't force re-authorisation
 - Only allows the Claude callback URLs as OAuth redirects, so nobody can register a phishing client against your login page
 - Failed-login lockout (5 attempts → 5 minute cool-off per IP)
@@ -29,7 +29,8 @@ Targets the Mealie **v2/v3 API** (`/api/households/...`); tested against Mealie 
 ## Requirements
 
 - Mealie reachable from wherever this runs (LAN is fine)
-- A Mealie **API token**: Mealie → your user → *API Tokens* → create (long-lived)
+- A Pocket ID client with PKCE, scopes `openid profile email`, and redirect URL `{PUBLIC_URL}/oidc/callback`
+- Each person creates their own Mealie API token the first time they connect (Mealie → your user → API Tokens). The token's email must match their Pocket ID email.
 - A **public HTTPS hostname** pointing at this server. Claude's servers must be able to reach it. If you already run a reverse proxy (Nginx Proxy Manager, Caddy, Traefik) with ports 80/443 forwarded, just add a host — see Option B. Otherwise the compose file includes a Cloudflare Tunnel (Option A).
 
 ## Run it (Docker, on Proxmox)
@@ -37,12 +38,12 @@ Targets the Mealie **v2/v3 API** (`/api/households/...`); tested against Mealie 
 On a VM or LXC with Docker:
 
 ```bash
-git clone https://github.com/retr083/mealie-mcp.git && cd mealie-mcp
+git clone https://github.com/cterrile/mealie-mcp.git && cd mealie-mcp
 cp .env.example .env
-nano .env        # MEALIE_URL, MEALIE_API_TOKEN, PUBLIC_URL, MCP_LOGIN_PASSWORD
+nano .env        # MEALIE_URL, POCKET_ID_*, PUBLIC_URL
 ```
 
-The compose file pulls the pre-built multi-arch image `ghcr.io/retr083/mealie-mcp:latest` (amd64 + arm64). To build from source instead, uncomment `build: .` in `docker-compose.yml` and add `--build` to the commands below.
+`docker-compose.yml` builds this fork. Upstream `ghcr.io/retr083/mealie-mcp` is the single-token server and will not use Pocket ID.
 
 ### Option A — Cloudflare Tunnel (no port forwarding)
 
@@ -93,7 +94,7 @@ mealie-mcp.yourdomain.com {
 
 ## Connect Claude
 
-**Claude mobile / web / desktop:** Settings → *Connectors* → *Add custom connector* → URL: `https://mealie-mcp.yourdomain.com/mcp` → leave the OAuth client ID/secret fields empty → *Add*. Claude will open your login page; enter `MCP_LOGIN_PASSWORD`. Done — enable the connector in a chat and ask it what's for dinner.
+**Claude mobile / web / desktop:** Settings → *Connectors* → *Add custom connector* → URL: `https://mealie-mcp.yourdomain.com/mcp` → leave the OAuth client ID/secret fields empty → *Add*. Claude opens Pocket ID. Sign in with a passkey. The first time, paste a Mealie API token for that same email. Later connections reuse the link.
 
 Custom connectors are added per account, so once it's added on the web it appears on mobile too.
 
@@ -113,15 +114,16 @@ then `/mcp` inside Claude Code to trigger the login.
 | Claude: "Failed to start MCP authorization" and **nothing** in `docker logs` | Claude never reached you. Hostname must resolve (from the public internet) to a public **IPv4** address — no private/CGNAT ranges, no AAAA-only. Check with `nslookup <host> 8.8.8.8` from mobile data. |
 | Claude: "Your account was authorized, but no MCP server was found at the provided URL" | Login worked but the connector URL is wrong — it must end in **`/mcp`**. Delete and re-add the connector with `https://<host>/mcp`. |
 | Claude: "Authorization with the MCP server failed" | `PUBLIC_URL` doesn't match the URL you entered (scheme/host must be identical, no trailing slash), or `/token` took >10 s. Check `docker logs mealie-mcp`. |
-| `/healthz` returns `503` | The container can't reach `MEALIE_URL`, or `MEALIE_API_TOKEN` is wrong. |
+| `/healthz` returns `503` | The container can't reach `MEALIE_URL`. |
+| Pocket ID login succeeds, then the link page rejects the token | The Mealie API token belongs to a different email than the Pocket ID account. |
 | Tool calls time out on slow recipe imports | Add the `proxy_read_timeout` lines from Option B to your proxy config. |
 
 Every failure toast in Claude includes an `ofid_…` reference; if you file an issue with [anthropics/claude-ai-mcp](https://github.com/anthropics/claude-ai-mcp/issues), include it along with your `docker logs` lines from the attempt.
 
 ## Limitations (read before exposing it)
 
-- **Single user, single password.** Anyone who knows the password gets full access to the Mealie account behind the API token. This is designed for a personal homelab, not multi-tenant use.
-- **Tokens are stored unhashed** in `data/auth_state.json` (they're random 48-byte secrets, but treat that file like a password file — it lives in a Docker volume for that reason).
+- **One Mealie token per Pocket ID user.** A person who can complete the Pocket ID login and paste a matching Mealie token can use that Mealie account. Mealie enforces that user's household and admin flag.
+- **Linked Mealie tokens are stored in `data/auth_state.json`.** Treat that file like a password file. It lives in a Docker volume for that reason.
 - **No account/session UI.** To revoke everything, delete `data/auth_state.json` and restart.
 - Pinned to `mcp==2.2.0` — the official SDK's server API is still changing between releases (e.g. `FastMCP` → `MCPServer`), so upgrades need a look, not just a bump.
 
@@ -130,9 +132,10 @@ Every failure toast in Claude includes an `ofid_…` reference; if you file an i
 | Variable | Default | Meaning |
 |---|---|---|
 | `MEALIE_URL` | — | Mealie base URL, as seen from this container |
-| `MEALIE_API_TOKEN` | — | Mealie API token (the server acts as that user) |
+| `POCKET_ID_ISSUER` | — | Public Pocket ID origin, no trailing slash |
+| `POCKET_ID_CLIENT_ID` | — | OIDC client id for this MCP server |
+| `POCKET_ID_CLIENT_SECRET` | — | OIDC client secret |
 | `PUBLIC_URL` | — | Public HTTPS origin of this server, no trailing slash, no `/mcp` |
-| `MCP_LOGIN_PASSWORD` | — | Password for the connect-time login page (min 12 chars) |
 | `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | Bind address |
 | `MCP_DATA_DIR` | `/data` | Where `auth_state.json` lives |
 | `MCP_ACCESS_TOKEN_TTL` | `3600` | Access token lifetime (s). Claude refreshes automatically. |
@@ -141,18 +144,19 @@ Every failure toast in Claude includes an `ofid_…` reference; if you file an i
 
 ## Security notes
 
-- Everything Claude can do, it does **as the Mealie user who owns the API token**. Create a dedicated Mealie user if you want to limit blast radius.
+- Everything Claude can do, it does **as the Mealie user whose API token was linked** to that Pocket ID login.
 - The MCP endpoint is only reachable with a valid bearer token; the login page is the only unauthenticated surface (plus OAuth metadata/registration, which are public by design).
 - For belt-and-braces you can restrict the hostname at your proxy/tunnel to Anthropic's egress range `160.79.104.0/21` — but note *you* also need to reach `/login` from your phone/browser during connect, so allow that too (or only enforce the IP rule on `/mcp`, `/token`, `/register`).
-- Revoke access at any time: delete `data/auth_state.json` and restart (or just rotate `MCP_LOGIN_PASSWORD` — existing tokens keep working until they expire, so delete the file too).
+- Revoke access by deleting `data/auth_state.json` and restarting. That drops linked Mealie tokens and MCP sessions.
 
 ## Local development
 
 ```bash
 python -m venv .venv && .venv/Scripts/activate      # or source .venv/bin/activate
 pip install -e .
-MEALIE_URL=http://mealie.lan:9925 MEALIE_API_TOKEN=... PUBLIC_URL=http://127.0.0.1:8000 \
-MCP_LOGIN_PASSWORD=correct-horse-battery MCP_DATA_DIR=./data python -m mealie_mcp
+MEALIE_URL=http://mealie.lan:9925 PUBLIC_URL=http://127.0.0.1:8000 \
+POCKET_ID_ISSUER=https://pocket-id.example.com POCKET_ID_CLIENT_ID=... POCKET_ID_CLIENT_SECRET=... \
+MCP_DATA_DIR=./data python -m mealie_mcp
 ```
 
 Built on the official [`mcp`](https://github.com/modelcontextprotocol/python-sdk) Python SDK (2.x) — the SDK provides the `/authorize`, `/token`, `/register`, `/revoke` and `.well-known` endpoints; this project supplies the provider, login page, Mealie client and tools.

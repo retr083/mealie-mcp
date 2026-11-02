@@ -1,1 +1,1 @@
-"""Remote MCP server for Mealie with a self-contained OAuth 2.1 authorization server."""
+"""Remote MCP server for Mealie. Pocket ID identifies the person; their Mealie API token authorizes the tools."""

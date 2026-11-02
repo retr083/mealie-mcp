@@ -1,9 +1,10 @@
-"""Single-user OAuth 2.1 authorization server backing the MCP endpoint.
+"""OAuth 2.1 authorization server backing the MCP endpoint.
 
-Claude (web / desktop / mobile) registers itself via Dynamic Client Registration,
-sends the user to /login, and exchanges the resulting code (PKCE S256, enforced by
-the SDK's /token handler) for a bearer token. Clients and tokens are persisted to a
-JSON file so a container restart doesn't force everyone to re-authorise.
+Claude registers itself via Dynamic Client Registration and sends the person to
+/login. That page redirects to Pocket ID. After the passkey login, the server
+links a Mealie API token for that person and exchanges the MCP authorization
+code for a bearer token. Tool calls use the linked token, so Mealie applies
+that person's household and admin rights.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ from mcp.server.auth.provider import (
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 from .config import Settings
+from .mealie import fetch_self
+from .oidc import PocketID, PocketIDError, emails_match, pkce_pair
 
 log = logging.getLogger(__name__)
 
@@ -65,10 +68,17 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         self.state_file = Path(settings.mcp_data_dir) / "auth_state.json"
         self._lock = asyncio.Lock()
 
+        self.pocket_id = PocketID(
+            str(settings.pocket_id_issuer),
+            settings.pocket_id_client_id,
+            settings.pocket_id_client_secret,
+        )
+
         # persisted
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.access_tokens: dict[str, AccessToken] = {}
         self.refresh_tokens: dict[str, RefreshToken] = {}
+        self.users: dict[str, dict] = {}  # pocket id sub -> mealie link
         # in-memory only (short lived)
         self.auth_codes: dict[str, AuthorizationCode] = {}
         self.pending: dict[str, dict] = {}  # login state -> authorize params
@@ -89,10 +99,11 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         self.clients = {k: OAuthClientInformationFull.model_validate(v) for k, v in raw.get("clients", {}).items()}
         self.access_tokens = {k: AccessToken.model_validate(v) for k, v in raw.get("access_tokens", {}).items()}
         self.refresh_tokens = {k: RefreshToken.model_validate(v) for k, v in raw.get("refresh_tokens", {}).items()}
+        self.users = dict(raw.get("users", {}))
         self._prune()
         log.info(
-            "Loaded auth state: %d clients, %d access tokens, %d refresh tokens",
-            len(self.clients), len(self.access_tokens), len(self.refresh_tokens),
+            "Loaded auth state: %d clients, %d access tokens, %d refresh tokens, %d linked users",
+            len(self.clients), len(self.access_tokens), len(self.refresh_tokens), len(self.users),
         )
 
     def _save(self) -> None:
@@ -102,10 +113,12 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             "clients": {k: v.model_dump(mode="json") for k, v in self.clients.items()},
             "access_tokens": {k: v.model_dump(mode="json") for k, v in self.access_tokens.items()},
             "refresh_tokens": {k: v.model_dump(mode="json") for k, v in self.refresh_tokens.items()},
+            "users": self.users,
         }
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=1))
         tmp.replace(self.state_file)
+        self.state_file.chmod(0o600)
 
     def _prune(self) -> None:
         now = time.time()
@@ -164,7 +177,14 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         lock_until = time.time() + LOCKOUT_SECONDS if count >= MAX_FAILED_LOGINS else 0.0
         self._failed_logins[ip] = (count, lock_until)
 
-    def login_page(self, request: Request, error: str | None = None) -> Response:
+    def mealie_token_for(self, subject: str | None) -> str | None:
+        if not subject:
+            return None
+        user = self.users.get(subject) or {}
+        token = user.get("mealie_api_token")
+        return token or None
+
+    async def start_login(self, request: Request) -> Response:
         self._prune()
         state = request.query_params.get("state", "")
         pending = self.pending.get(state)
@@ -172,46 +192,108 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             return HTMLResponse(
                 _page("Sign-in link expired", "<p>Start the connection again from Claude.</p>"), status_code=400
             )
-        client = self.clients.get(pending["client_id"])
-        client_name = html.escape((client.client_name if client else None) or pending["client_id"])
-        redirect_host = html.escape(urlsplit(pending["redirect_uri"]).netloc)
-        err_html = f'<p class="err">{html.escape(error)}</p>' if error else ""
-        body = f"""
-          <p><strong>{client_name}</strong> is asking for access to your Mealie recipes,
-             shopping lists and meal plans.</p>
-          <p class="muted">After signing in you will be sent back to <code>{redirect_host}</code>.</p>
-          {err_html}
-          <form method="post" action="{self.settings.public_base}/login">
-            <input type="hidden" name="state" value="{html.escape(state)}">
-            <label for="pw">Password</label>
-            <input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
-            <button type="submit">Allow access</button>
-          </form>"""
-        return HTMLResponse(_page("Connect Claude to Mealie", body))
+        verifier, challenge = pkce_pair()
+        pending["oidc_verifier"] = verifier
+        try:
+            url = await self.pocket_id.authorize_url(self.settings.public_base, state, challenge)
+        except PocketIDError as exc:
+            log.exception("Pocket ID authorize URL failed")
+            return HTMLResponse(_page("Pocket ID unavailable", f"<p>{html.escape(exc.message)}</p>"), status_code=502)
+        return RedirectResponse(url, status_code=302)
 
-    async def handle_login(self, request: Request) -> Response:
+    async def handle_oidc_callback(self, request: Request) -> Response:
         self._prune()
-        form = await request.form()
-        state = str(form.get("state") or "")
-        password = str(form.get("password") or "")
+        state = request.query_params.get("state", "")
         pending = self.pending.get(state)
-        if not pending:
+        if not pending or "oidc_verifier" not in pending:
             return HTMLResponse(
                 _page("Sign-in link expired", "<p>Start the connection again from Claude.</p>"), status_code=400
             )
+        if request.query_params.get("error"):
+            detail = request.query_params.get("error_description") or request.query_params.get("error")
+            return HTMLResponse(_page("Pocket ID login was not completed", f"<p>{html.escape(detail or '')}</p>"), status_code=400)
+        code = request.query_params.get("code", "")
+        if not code:
+            return HTMLResponse(_page("Pocket ID login failed", "<p>No authorization code was returned.</p>"), status_code=400)
+        try:
+            token = await self.pocket_id.exchange(self.settings.public_base, code, pending["oidc_verifier"])
+            info = await self.pocket_id.userinfo(token["access_token"])
+        except (PocketIDError, KeyError) as exc:
+            message = exc.message if isinstance(exc, PocketIDError) else "Pocket ID did not return an access token."
+            log.exception("Pocket ID callback failed")
+            return HTMLResponse(_page("Pocket ID login failed", f"<p>{html.escape(message)}</p>"), status_code=502)
+        subject = str(info.get("sub") or "")
+        email = str(info.get("email") or "")
+        if not subject or not email:
+            return HTMLResponse(
+                _page("Pocket ID login failed", "<p>Pocket ID did not return a subject and email.</p>"),
+                status_code=502,
+            )
+        pending["oidc_sub"] = subject
+        pending["oidc_email"] = email
+        if subject in self.users:
+            return self._finish(pending, state)
+        return self._link_page(state, email)
 
+    def _link_page(self, state: str, email: str, error: str | None = None) -> Response:
+        err_html = f'<p class="err">{html.escape(error)}</p>' if error else ""
+        body = f"""
+          <p>Signed in as <strong>{html.escape(email)}</strong>.</p>
+          <p class="muted">Paste a Mealie API token from that same account
+             (Mealie → your user → API Tokens). Tools will act as this user.</p>
+          {err_html}
+          <form method="post" action="{self.settings.public_base}/link">
+            <input type="hidden" name="state" value="{html.escape(state)}">
+            <label for="token">Mealie API token</label>
+            <input id="token" name="mealie_api_token" type="password" autocomplete="off" autofocus required>
+            <button type="submit">Link and allow access</button>
+          </form>"""
+        return HTMLResponse(_page("Link your Mealie account", body))
+
+    async def handle_link(self, request: Request) -> Response:
+        self._prune()
+        form = await request.form()
+        state = str(form.get("state") or "")
+        mealie_token = str(form.get("mealie_api_token") or "").strip()
+        pending = self.pending.get(state)
+        if not pending or "oidc_sub" not in pending:
+            return HTMLResponse(
+                _page("Sign-in link expired", "<p>Start the connection again from Claude.</p>"), status_code=400
+            )
+        email = pending["oidc_email"]
         ip = self._client_ip(request)
         if self._locked_out(ip):
             return HTMLResponse(_page("Too many attempts", "<p>Try again in a few minutes.</p>"), status_code=429)
-        if not secrets.compare_digest(password.encode(), self.settings.mcp_login_password.encode()):
+        if not mealie_token:
+            return self._link_page(state, email, error="Paste a Mealie API token.")
+        try:
+            profile = await fetch_self(str(self.settings.mealie_url), mealie_token)
+        except Exception as exc:  # MealieError or unexpected
             self._record_failure(ip)
-            log.warning("Failed login from %s", ip)
-            # re-render with the state still in the query string
-            request.scope["query_string"] = f"state={state}".encode()
-            return self.login_page(request, error="Wrong password.")
-
+            log.warning("Mealie token link failed from %s: %s", ip, exc)
+            return self._link_page(state, email, error=str(exc))
+        if not emails_match(profile.get("email"), email):
+            self._record_failure(ip)
+            log.warning("Mealie token email did not match Pocket ID email for %s", email)
+            return self._link_page(
+                state,
+                email,
+                error="That token belongs to a different Mealie email than this Pocket ID login.",
+            )
+        async with self._lock:
+            self.users[pending["oidc_sub"]] = {
+                "email": email,
+                "mealie_api_token": mealie_token,
+                "mealie_username": profile.get("username") or "",
+            }
+            self._save()
         self._failed_logins.pop(ip, None)
-        del self.pending[state]
+        log.info("Linked Pocket ID user %s to Mealie user %s", email, profile.get("username"))
+        return self._finish(pending, state)
+
+    def _finish(self, pending: dict, state: str) -> Response:
+        subject = pending["oidc_sub"]
+        self.pending.pop(state, None)
         code = secrets.token_urlsafe(32)
         self.auth_codes[code] = AuthorizationCode(
             code=code,
@@ -222,9 +304,9 @@ class MealieOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             scopes=pending["scopes"],
             code_challenge=pending["code_challenge"],
             resource=pending["resource"],
-            subject="owner",
+            subject=subject,
         )
-        log.info("Login OK from %s for client %s", ip, pending["client_id"])
+        log.info("Login OK for %s client %s", pending.get("oidc_email"), pending["client_id"])
         return RedirectResponse(
             construct_redirect_uri(pending["redirect_uri"], code=code, state=pending["client_state"]),
             status_code=302,
