@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from mealie_mcp.auth import MealieOAuthProvider
+from mealie_mcp.auth import MealieOAuthProvider, _redirect_uri_allowed
 from mealie_mcp.config import Settings
 from mealie_mcp.oidc import emails_match, pkce_pair
 
@@ -22,6 +22,18 @@ class OidcHelpers(unittest.TestCase):
         self.assertTrue(emails_match("Ada@Example.com", "ada@example.com"))
         self.assertFalse(emails_match("ada@example.com", "other@example.com"))
         self.assertFalse(emails_match("", "ada@example.com"))
+
+    def test_chatgpt_redirects_are_allowed(self):
+        allowed = ["https://claude.ai/api/mcp/auth_callback"]
+        self.assertTrue(
+            _redirect_uri_allowed("https://chatgpt.com/connector/oauth/callback-123", allowed)
+        )
+        self.assertTrue(
+            _redirect_uri_allowed("https://chatgpt.com/connector_platform_oauth_redirect", allowed)
+        )
+        self.assertFalse(_redirect_uri_allowed("https://chatgpt.com/connector/oauth/", allowed))
+        self.assertFalse(_redirect_uri_allowed("https://chatgpt.com/connector/oauth/a/b", allowed))
+        self.assertFalse(_redirect_uri_allowed("https://evil.example/connector/oauth/abc", allowed))
 
     def test_pkce_challenge_is_url_safe(self):
         verifier, challenge = pkce_pair()

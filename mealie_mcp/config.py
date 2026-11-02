@@ -24,9 +24,11 @@ class Settings(BaseSettings):
     mcp_scope: str = "mealie"
     # Redirect URIs a dynamically-registered client may use. Claude's hosted surfaces
     # (web/desktop/mobile) use the claude.ai callback; Claude Code uses a loopback
-    # redirect on a random port (port is ignored when matching).
+    # redirect on a random port (port is ignored when matching). ChatGPT callbacks
+    # under https://chatgpt.com/connector/oauth/ are allowed in addition to this list.
     mcp_allowed_redirect_uris: list[str] = [
         "https://claude.ai/api/mcp/auth_callback",
+        "https://chatgpt.com/connector_platform_oauth_redirect",
         "http://localhost/callback",
         "http://127.0.0.1/callback",
     ]

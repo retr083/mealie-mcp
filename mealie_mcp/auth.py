@@ -46,8 +46,29 @@ MAX_FAILED_LOGINS = 5
 LOCKOUT_SECONDS = 300
 
 
+def _is_chatgpt_redirect(uri: str) -> bool:
+    """ChatGPT's OAuth callback.
+
+    Without RFC 9207 issuer identification, ChatGPT registers
+    https://chatgpt.com/connector/oauth/{callback_id}. Servers that return
+    iss use the stable https://chatgpt.com/connector_platform_oauth_redirect.
+    """
+    parts = urlsplit(uri)
+    if parts.scheme != "https" or parts.hostname != "chatgpt.com":
+        return False
+    if parts.path == "/connector_platform_oauth_redirect":
+        return True
+    prefix = "/connector/oauth/"
+    if not parts.path.startswith(prefix):
+        return False
+    callback_id = parts.path.removeprefix(prefix)
+    return bool(callback_id) and "/" not in callback_id and callback_id not in {".", ".."}
+
+
 def _redirect_uri_allowed(uri: str, allowed: list[str]) -> bool:
     """Exact match, except loopback hosts where the port is ignored (RFC 8252 s7.3)."""
+    if _is_chatgpt_redirect(uri):
+        return True
     u = urlsplit(uri)
     for a in allowed:
         p = urlsplit(a)
