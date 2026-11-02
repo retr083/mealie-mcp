@@ -15,10 +15,13 @@ class MealieError(ToolError):
 
 
 class MealieClient:
-    def __init__(self, base_url: str, token: str, timeout: float = 30.0):
+    def __init__(self, base_url: str, token: str | None = None, timeout: float = 30.0):
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         self._http = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            headers=headers,
             timeout=timeout,
         )
 
@@ -62,6 +65,27 @@ class MealieClient:
 
     async def delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return await self.request("DELETE", path, params=params)
+
+
+async def fetch_self(base_url: str, token: str) -> dict[str, Any]:
+    """Identify the Mealie user that owns an API token. Used once, when linking."""
+    async with httpx.AsyncClient(
+        base_url=base_url.rstrip("/"),
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=20.0,
+    ) as client:
+        try:
+            response = await client.get("/api/users/self")
+        except httpx.HTTPError as exc:
+            raise MealieError(f"Could not reach Mealie: {exc.__class__.__name__}: {exc}") from exc
+    if response.status_code == 401:
+        raise MealieError("Mealie rejected that API token.")
+    if response.status_code >= 400:
+        raise MealieError(f"Mealie /api/users/self -> {response.status_code}")
+    body = response.json()
+    if not isinstance(body, dict):
+        raise MealieError("Mealie did not return a user profile.")
+    return body
 
 
 # ---------- response shaping (keep tool output small for the model) ----------
