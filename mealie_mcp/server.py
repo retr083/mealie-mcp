@@ -148,9 +148,12 @@ async def get_recipe(slug: str) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=WRITE)
-async def import_recipe_from_url(url: str, include_tags: bool = True) -> dict[str, Any]:
-    """Scrape a recipe web page into Mealie. Returns the new recipe."""
+async def import_recipe_from_url(url: str, include_tags: bool = True, tags: list[str] | None = None) -> dict[str, Any]:
+    """Scrape a recipe web page into Mealie. Returns the new recipe. `tags` are extra tag names
+    to add after import (created if missing, matched case-insensitively by name or slug)."""
     slug = await mealie().post("/api/recipes/create/url", {"url": url, "includeTags": include_tags})
+    if tags:
+        await _apply_recipe_tags(slug, add=tags, remove=[])
     return recipe_full(await mealie().get(f"/api/recipes/{slug}"))
 
 
@@ -261,6 +264,53 @@ async def delete_recipe(slug: str) -> str:
     """Permanently delete a recipe by slug. Confirm with the user first."""
     await mealie().delete(f"/api/recipes/{slug}")
     return f"Deleted recipe {slug}"
+
+
+def _clean_names(names: list[str] | None) -> list[str]:
+    return [n.strip() for n in (names or []) if n and n.strip()]
+
+
+def _tag_matches(tag: dict, name: str) -> bool:
+    key = name.casefold()
+    return (tag.get("name") or "").casefold() == key or (tag.get("slug") or "").casefold() == key
+
+
+def _tag_ref(tag: dict) -> dict[str, Any]:
+    return {"id": tag["id"], "name": tag["name"], "slug": tag["slug"]}
+
+
+async def _apply_recipe_tags(slug: str, add: list[str], remove: list[str]) -> dict:
+    """Add/remove tags on a recipe by name or slug, creating missing tags. Returns the patched recipe."""
+    add, remove = _clean_names(add), _clean_names(remove)
+    recipe = await mealie().get(f"/api/recipes/{slug}")
+    current: list[dict] = recipe.get("tags") or []
+
+    to_add: list[dict] = []
+    if add:
+        existing: list[dict] = (await mealie().get("/api/organizers/tags", {"perPage": -1})).get("items", [])
+        for name in add:
+            tag = next((t for t in existing if _tag_matches(t, name)), None)
+            if tag is None:
+                tag = await mealie().post("/api/organizers/tags", {"name": name})
+                existing.append(tag)
+            to_add.append(tag)
+
+    merged: dict[str, dict] = {}
+    for tag in [*current, *to_add]:
+        if not any(_tag_matches(tag, name) for name in remove):
+            merged.setdefault(tag["id"], _tag_ref(tag))
+    return await mealie().patch(f"/api/recipes/{slug}", {"tags": list(merged.values())})
+
+
+@mcp.tool(annotations=WRITE)
+async def set_recipe_tags(slug: str, add: list[str] | None = None, remove: list[str] | None = None) -> list[str]:
+    """Add and/or remove tags on a recipe. Tag names are free text, matched case-insensitively by
+    name or slug; tags in `add` that don't exist yet are created. Tags not named in `remove` are
+    kept. Returns the recipe's final tag names."""
+    if not _clean_names(add) and not _clean_names(remove):
+        raise ValueError("nothing to update: give tags to add or remove")
+    recipe = await _apply_recipe_tags(slug, add or [], remove or [])
+    return [t.get("name", "") for t in recipe.get("tags") or []]
 
 
 @mcp.tool(annotations=READ)
